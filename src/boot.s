@@ -40,14 +40,9 @@ multiboot_header_start:
     dd 12
     dd _start
 
-    ; Framebuffer request (type 5): ask GRUB for 1024x768 at 32 bpp. Optional tag.
-    align 8
-    dw 5
-    dw 1                        ; flags: optional
-    dd 20
-    dd 1024
-    dd 768
-    dd 32
+    ; (No framebuffer request tag: GRUB leaves the screen in standard
+    ; VGA text mode at boot, which is what the shell writes to. The GUI
+    ; command switches to graphics mode later, on demand.)
 
     ; End tag
     align 8
