@@ -19,7 +19,7 @@ ASFLAGS = -f elf64
 
 # Source files
 BOOT     = src/boot.s
-IDT_ASM  = src/idt.s
+IDT_ASM  = src/idt_stubs.s
 KERNEL   = src/kernel.c
 SOURCES  = src/vga.c src/keyboard.c src/fb.c src/font.c src/window.c \
            src/gui_commands.c src/mouse.c src/cursor.c src/idt.c \
