@@ -77,4 +77,4 @@ This is the first version confirmed to build and boot successfully (in QEMU). It
 
 ## License
 
-TBD.
+MIT license. It can be found in /LICENSE.md 
