@@ -1,8 +1,2 @@
 blank_issues_enabled: false
-contact_links:
-  - name: Bug report
-    url: https://github.com/JackCortines/x64-kernel/issues/new?template=bug_report.yml
-    about: Create a report to help us improve.
-  - name: Feature request
-    url: https://github.com/JackCortines/x64-kernel/issues/new?template=Feature_request.yml
-    about: Suggest an idea for this project.
+contact_links: []
