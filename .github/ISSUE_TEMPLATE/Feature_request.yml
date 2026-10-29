@@ -1,0 +1,63 @@
+name: Feature request
+description: Suggest an enhancement or new capability
+title: ""
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a feature. Please describe it below.
+
+  - type: input
+    id: feature_title
+    attributes:
+      label: Feature summary
+      description: A short name for the feature.
+      placeholder: e.g. Add SMP boot support
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or motivation
+      description: What problem does this feature solve?
+      placeholder: |
+        Example: The kernel currently cannot boot across multiple CPUs, which limits performance and future compatibility.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed_solution
+    attributes:
+      label: Proposed solution
+      description: Describe the idea, behavior, or implementation direction.
+      placeholder: |
+        Example: Add support for AP startup and a proper multi-core bootstrap sequence.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      description: How important is this feature?
+      options:
+        - Low
+        - Medium
+        - High
+        - Critical
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Additional notes
+      description: Include technical notes, use cases, references, or examples.
+      placeholder: |
+        Example:
+        - Related issues or commits
+        - Expected impact
+        - Compatibility concerns
+        - Alternative designs
