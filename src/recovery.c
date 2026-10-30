@@ -15,7 +15,7 @@ static recovery_state_t current_state = {
 void recovery_init(void) {
     vga_clear();
     vga_set_color(VGA_COLOR_YELLOW, VGA_COLOR_BLACK);
-    vga_print("BrackOS v1.7 Recovery System\n");
+    vga_print("BrackOS v1.2.0 Recovery System\n");
     vga_print("=============================\n\n");
     
     /* Check for repeated failures */
@@ -72,8 +72,8 @@ void recovery_run_diagnostics(void) {
     
     if (current_state.last_error != RECOVERY_ERR_NONE) {
         vga_set_color(VGA_COLOR_RED, VGA_COLOR_BLACK);
-        vga_print("! Error code: 0x");
-        vga_print_int(current_state.last_error);
+        vga_print("! Error code: ");
+        vga_print_hex(current_state.last_error);
         vga_print("\n");
         vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
         vga_print("Press any key to continue...\n");

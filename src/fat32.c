@@ -22,6 +22,10 @@ static uint8_t sector_buffer[SECTOR_SIZE];
 #define IDE_CMD_READ    0x20
 #define IDE_CMD_WRITE   0x30
 #define IDE_CMD_FLUSH   0xE7
+#define IDE_CMD_READ_EXT   0x24   /* 48-bit LBA variants */
+#define IDE_CMD_WRITE_EXT  0x34
+#define IDE_CMD_FLUSH_EXT  0xEA
+#define IDE_LBA28_LIMIT    0x10000000u
 
 #define IDE_STATUS_ERR  0x01
 #define IDE_STATUS_DRQ  0x08
@@ -53,19 +57,34 @@ static int ide_wait_drq(void) {
     return -1;
 }
 
-static void ide_select(uint32_t sector) {
+/* Select a sector. Sectors below 2^28 use the classic 28-bit LBA commands;
+ * higher ones use 48-bit LBA. Returns 1 when 48-bit commands must be used. */
+static int ide_select(uint32_t sector) {
+    if (sector >= IDE_LBA28_LIMIT) {
+        outb(IDE_DRIVE_HEAD, 0x40);                 /* LBA mode, master drive */
+        outb(IDE_SECTOR_CNT, 0);                    /* high bytes first ... */
+        outb(IDE_LBA_LOW,  (sector >> 24) & 0xFF);
+        outb(IDE_LBA_MID,  0);
+        outb(IDE_LBA_HIGH, 0);
+        outb(IDE_SECTOR_CNT, 1);                    /* ... then the low bytes */
+        outb(IDE_LBA_LOW,  sector & 0xFF);
+        outb(IDE_LBA_MID,  (sector >> 8) & 0xFF);
+        outb(IDE_LBA_HIGH, (sector >> 16) & 0xFF);
+        return 1;
+    }
     outb(IDE_SECTOR_CNT, 1);
     outb(IDE_LBA_LOW,  sector & 0xFF);
     outb(IDE_LBA_MID,  (sector >> 8) & 0xFF);
     outb(IDE_LBA_HIGH, (sector >> 16) & 0xFF);
     outb(IDE_DRIVE_HEAD, 0xE0 | ((sector >> 24) & 0x0F));  /* LBA mode */
+    return 0;
 }
 
-/* Read one 512-byte sector */
-int fat32_read_sector(uint32_t sector, uint8_t *buffer) {
+/* Read one 512-byte sector straight from the disk */
+static int ata_read_sector(uint32_t sector, uint8_t *buffer) {
     if (ide_wait_not_busy() != 0) return -1;
-    ide_select(sector);
-    outb(IDE_COMMAND, IDE_CMD_READ);
+    int ext = ide_select(sector);
+    outb(IDE_COMMAND, ext ? IDE_CMD_READ_EXT : IDE_CMD_READ);
     if (ide_wait_drq() != 0) return -1;
 
     for (int i = 0; i < 256; i++) {
@@ -76,11 +95,11 @@ int fat32_read_sector(uint32_t sector, uint8_t *buffer) {
     return 0;
 }
 
-/* Write one 512-byte sector */
-int fat32_write_sector(uint32_t sector, uint8_t *buffer) {
+/* Write one 512-byte sector straight to the disk */
+static int ata_write_sector(uint32_t sector, const uint8_t *buffer) {
     if (ide_wait_not_busy() != 0) return -1;
-    ide_select(sector);
-    outb(IDE_COMMAND, IDE_CMD_WRITE);
+    int ext = ide_select(sector);
+    outb(IDE_COMMAND, ext ? IDE_CMD_WRITE_EXT : IDE_CMD_WRITE);
     if (ide_wait_drq() != 0) return -1;
 
     for (int i = 0; i < 256; i++) {
@@ -88,8 +107,64 @@ int fat32_write_sector(uint32_t sector, uint8_t *buffer) {
     }
 
     /* Flush the drive's write cache so the data is really on disk */
-    outb(IDE_COMMAND, IDE_CMD_FLUSH);
+    outb(IDE_COMMAND, ext ? IDE_CMD_FLUSH_EXT : IDE_CMD_FLUSH);
     if (ide_wait_not_busy() != 0) return -1;
+    return 0;
+}
+
+/* ---------- Sector cache ----------
+ * Direct-mapped, write-through: reads are served from memory when possible
+ * and every write goes to the disk immediately, so the cache never holds
+ * data the disk does not have. */
+#define CACHE_SLOTS 256                 /* power of two; 256 x 512 B = 128 KB */
+
+typedef struct {
+    uint32_t lba;
+    int      valid;
+    uint8_t  data[SECTOR_SIZE];
+} cache_slot_t;
+
+static cache_slot_t cache[CACHE_SLOTS];
+static uint32_t cache_hits, cache_misses, cache_writes;
+
+void fat32_cache_clear(void) {
+    for (int i = 0; i < CACHE_SLOTS; i++) cache[i].valid = 0;
+}
+
+void fat32_cache_stats(uint32_t *hits, uint32_t *misses, uint32_t *writes) {
+    *hits = cache_hits;
+    *misses = cache_misses;
+    *writes = cache_writes;
+}
+
+/* Read one 512-byte sector (through the cache) */
+int fat32_read_sector(uint32_t sector, uint8_t *buffer) {
+    cache_slot_t *slot = &cache[sector & (CACHE_SLOTS - 1)];
+    if (slot->valid && slot->lba == sector) {
+        cache_hits++;
+        memcpy(buffer, slot->data, SECTOR_SIZE);
+        return 0;
+    }
+    cache_misses++;
+    slot->valid = 0;
+    if (ata_read_sector(sector, slot->data) != 0) return -1;
+    slot->lba = sector;
+    slot->valid = 1;
+    memcpy(buffer, slot->data, SECTOR_SIZE);
+    return 0;
+}
+
+/* Write one 512-byte sector (to the disk first, then into the cache) */
+int fat32_write_sector(uint32_t sector, uint8_t *buffer) {
+    cache_slot_t *slot = &cache[sector & (CACHE_SLOTS - 1)];
+    cache_writes++;
+    if (ata_write_sector(sector, buffer) != 0) {
+        if (slot->valid && slot->lba == sector) slot->valid = 0;   /* unknown state */
+        return -1;
+    }
+    memcpy(slot->data, buffer, SECTOR_SIZE);
+    slot->lba = sector;
+    slot->valid = 1;
     return 0;
 }
 
@@ -117,65 +192,118 @@ static int fat_set(uint32_t cluster, uint32_t value) {
     return 0;
 }
 
-/* Initialize FAT32 filesystem */
+/* Does this boot sector describe a FAT32 volume? */
+static int bpb_valid(const boot_sector_t *b) {
+    return b->bytes_per_sector == SECTOR_SIZE &&
+           b->sectors_per_cluster != 0 &&
+           b->fats != 0 &&
+           b->root_entries == 0 &&            /* FAT12/16 have a fixed root directory */
+           b->sectors_per_fat_small == 0 &&
+           b->sectors_per_fat != 0 &&
+           b->root_cluster >= 2;
+}
+
+/* Try to mount the FAT32 volume whose boot sector is at lba.
+ * Returns 0 on success, -1 if there is no FAT32 volume there, -2 on a disk error. */
+static int mount_volume(uint32_t lba) {
+    uint8_t buf[SECTOR_SIZE];
+    if (fat32_read_sector(lba, buf) != 0) return -2;
+    if (buf[510] != 0x55 || buf[511] != 0xAA) return -1;
+
+    boot_sector_t b;
+    memcpy(&b, buf, sizeof(boot_sector_t));
+    if (!bpb_valid(&b)) return -1;
+
+    uint32_t fat_sectors = (uint32_t)b.fats * b.sectors_per_fat;
+    uint32_t total = b.total_sectors ? b.total_sectors : b.small_sectors;
+    if (total <= (uint32_t)b.reserved_sectors + fat_sectors) return -1;
+
+    /* Calculate filesystem layout (all absolute sector numbers) */
+    fat32_fs.boot = b;
+    fat32_fs.partition_lba = lba;
+    fat32_fs.fat_start_sector = lba + b.reserved_sectors;
+    fat32_fs.data_start_sector = fat32_fs.fat_start_sector + fat_sectors;
+    fat32_fs.root_dir_cluster = b.root_cluster;
+    fat32_fs.total_clusters = (total - b.reserved_sectors - fat_sectors) / b.sectors_per_cluster;
+    fat32_fs.next_free_hint = 2;
+    return 0;
+}
+
+/* Initialize FAT32 filesystem. drive_lba is where the volume starts; when
+ * it is 0 and sector 0 is not a FAT32 boot sector, the MBR partition table
+ * is searched for a FAT32 partition. */
 int fat32_init(uint32_t drive_lba) {
-    if (fat32_read_sector(drive_lba, sector_buffer) != 0) {
+    fat32_cache_clear();
+    int r = mount_volume(drive_lba);
+
+    if (r == -1 && drive_lba == 0) {
+        uint8_t mbr[SECTOR_SIZE];
+        if (fat32_read_sector(0, mbr) == 0 && mbr[510] == 0x55 && mbr[511] == 0xAA) {
+            for (int i = 0; i < 4 && r != 0; i++) {
+                const uint8_t *e = &mbr[446 + 16 * i];
+                uint32_t start;
+                memcpy(&start, &e[8], 4);
+                if ((e[4] == 0x0B || e[4] == 0x0C) && start != 0) {   /* FAT32 CHS / LBA */
+                    r = mount_volume(start);
+                }
+            }
+        }
+    }
+
+    if (r == -2) {
         vga_print("FAT32: Failed to read boot sector\n");
         return -1;
     }
-
-    /* Validate boot sector signature */
-    if (sector_buffer[510] != 0x55 || sector_buffer[511] != 0xAA) {
-        vga_print("FAT32: Invalid boot signature\n");
+    if (r != 0) {
+        vga_print("FAT32: No FAT32 volume found\n");
         return -1;
     }
-
-    memcpy(&fat32_fs.boot, sector_buffer, sizeof(boot_sector_t));
-
-    /* Sanity checks: this must look like a FAT32 volume */
-    if (fat32_fs.boot.bytes_per_sector != SECTOR_SIZE ||
-        fat32_fs.boot.sectors_per_cluster == 0 ||
-        fat32_fs.boot.fats == 0 ||
-        fat32_fs.boot.sectors_per_fat == 0 ||
-        fat32_fs.boot.root_cluster < 2) {
-        vga_print("FAT32: Not a FAT32 volume\n");
-        return -1;
-    }
-
-    /* Calculate filesystem layout (all absolute sector numbers) */
-    fat32_fs.fat_start_sector = drive_lba + fat32_fs.boot.reserved_sectors;
-    fat32_fs.data_start_sector = fat32_fs.fat_start_sector +
-                                 (fat32_fs.boot.fats * fat32_fs.boot.sectors_per_fat);
-    fat32_fs.root_dir_cluster = fat32_fs.boot.root_cluster;
 
     vga_print("FAT32: Initialized (");
     vga_print_int(fat32_fs.boot.bytes_per_sector);
     vga_print(" bytes/sector, cluster=");
     vga_print_int(fat32_fs.boot.sectors_per_cluster);
-    vga_print(" sectors)\n");
+    vga_print(" sectors");
+    if (fat32_fs.partition_lba != 0) {
+        vga_print(", partition at LBA ");
+        vga_print_int((int)fat32_fs.partition_lba);
+    }
+    vga_print(")\n");
 
     return 0;
 }
 
-/* Get next cluster in FAT chain */
+/* Get next cluster in FAT chain. Clusters outside the volume read as end-of-chain,
+ * so a damaged chain can never send us reading past the FAT. */
 uint32_t fat32_get_next_cluster(uint32_t cluster) {
+    if (cluster < 2 || cluster >= fat32_fs.total_clusters + 2) return FAT_EOC_MARK;
+
+    uint8_t buf[SECTOR_SIZE];       /* local: must not clobber callers' sector_buffer */
     uint32_t fat_offset = cluster * 4;
     uint32_t fat_sector = fat32_fs.fat_start_sector + (fat_offset / SECTOR_SIZE);
     uint32_t offset_in_sector = fat_offset % SECTOR_SIZE;
 
-    if (fat32_read_sector(fat_sector, sector_buffer) != 0) {
+    if (fat32_read_sector(fat_sector, buf) != 0) {
         return FAT_NO_CLUSTER;
     }
 
     uint32_t next_cluster;
-    memcpy(&next_cluster, &sector_buffer[offset_in_sector], 4);
+    memcpy(&next_cluster, &buf[offset_in_sector], 4);
     return next_cluster & 0x0FFFFFFF;  /* Mask to 28 bits */
 }
 
-/* Get free cluster (simple linear search) */
+/* Find a free cluster. Searches only inside the volume, starting from where
+ * the last search ended (wrapping around once). */
 uint32_t fat32_get_free_cluster(void) {
-    for (uint32_t cluster = 2; cluster < FAT_EOC_MIN; cluster++) {
+    uint32_t n = fat32_fs.total_clusters;
+    if (n == 0) return FAT_NO_CLUSTER;
+    uint32_t start = fat32_fs.next_free_hint;
+    if (start < 2 || start >= n + 2) start = 2;
+
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t cluster = 2 + (start - 2 + i) % n;
         if (fat32_get_next_cluster(cluster) == FAT_FREE) {
+            fat32_fs.next_free_hint = cluster + 1;
             return cluster;
         }
     }
@@ -412,7 +540,7 @@ int fat32_delete_file(uint32_t dir_cluster, const char *name) {
     if (e->attributes & 0x10) return -2;   /* directory */
     uint32_t first = ((uint32_t)e->first_cluster_high << 16) | e->first_cluster_low;
 
-    free_chain(first);   /* overwrites sector_buffer, so re-read below */
+    free_chain(first);   /* re-read the directory sector to be safe */
 
     if (fat32_read_sector(sector, sector_buffer) != 0) return -1;
     e = (dir_entry_t *)&sector_buffer[offset];

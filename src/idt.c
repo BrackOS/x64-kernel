@@ -1,7 +1,9 @@
 #include "idt.h"
+#include <stdint.h>
 #include "io.h"
 #include "vga.h"
 #include "timer.h"
+#include "gdt.h"
 
 #define IDT_ENTRIES 256
 
@@ -16,27 +18,74 @@ static idt_ptr_t idt_ptr;
 
 #define PIC_EOI    0x20
 
-// Interrupt/Exception handlers
-void exception_handler(int exception_num) {
+// CPU exception names, indexed by vector
+static const char *const exception_names[32] = {
+    "Divide error", "Debug", "Non-maskable interrupt", "Breakpoint",
+    "Overflow", "Bound range exceeded", "Invalid opcode", "Device not available",
+    "Double fault", "Coprocessor segment overrun", "Invalid TSS", "Segment not present",
+    "Stack-segment fault", "General protection fault", "Page fault", "Reserved",
+    "x87 floating-point error", "Alignment check", "Machine check", "SIMD floating-point error",
+    "Virtualization", "Control protection", "Reserved", "Reserved",
+    "Reserved", "Reserved", "Reserved", "Reserved",
+    "Reserved", "VMM communication", "Security", "Reserved"
+};
+
+// Called from isr_common. Prints what happened and halts.
+void exception_handler(uintptr_t vector, uintptr_t error_code, uintptr_t ip) {
     vga_set_color(12, 0);  // Red text
-    vga_print("EXCEPTION: ");
-    vga_print_int(exception_num);
-    vga_putchar('\n');
+    vga_print("\nEXCEPTION ");
+    vga_print_int((int)vector);
+    vga_print(": ");
+    vga_print(vector < 32 ? exception_names[vector] : "Unknown");
+    vga_print("\n  Error code: ");
+    vga_print_hex(error_code);
+    vga_print("\n  At address: ");
+    vga_print_hex(ip);
+    vga_print("\n");
+    if (vector == 14) {
+        uintptr_t cr2;
+        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+        vga_print("  Fault address (CR2): ");
+        vga_print_hex(cr2);
+        vga_print("\n");
+        extern char stack_guard[];
+        if (cr2 >= (uintptr_t)stack_guard && cr2 < (uintptr_t)stack_guard + 4096) {
+            vga_print("  Kernel stack overflow (guard page hit)\n");
+        } else if (cr2 < 4096) {
+            vga_print("  Null pointer access\n");
+        } else if (error_code & 0x10) {
+            vga_print("  Tried to run non-executable memory\n");
+        } else if ((error_code & 0x3) == 0x3) {
+            vga_print("  Write to read-only memory\n");
+        }
+    }
     vga_set_color(7, 0);
     vga_print("System halted.\n");
     for (;;) {
         asm volatile("cli; hlt");
     }
-    
-    // Halt
-    for (;;) {
-        asm volatile("hlt");
-    }
 }
 
-void irq_handler(int vector) {
+// Read the In-Service Register of one PIC (used to spot spurious IRQs)
+static uint8_t pic_read_isr(uint16_t cmd_port) {
+    outb(cmd_port, 0x0B);   // OCW3: read ISR
+    return inb(cmd_port);
+}
+
+void irq_handler(uintptr_t vector) {
     /* The PIC is remapped so hardware IRQ n arrives as vector 32 + n */
-    int irq = vector - 32;
+    int irq = (int)vector - 32;
+
+    /* Spurious IRQ 7 / 15: the PIC raised the line but nothing is in
+     * service. Do not acknowledge IRQ 7; for IRQ 15 only the master
+     * (which saw the cascade line) needs an EOI. */
+    if (irq == 7 && !(pic_read_isr(PIC1_CMD) & 0x80)) {
+        return;
+    }
+    if (irq == 15 && !(pic_read_isr(PIC2_CMD) & 0x80)) {
+        outb(PIC1_CMD, PIC_EOI);
+        return;
+    }
 
     switch (irq) {
         case IRQ_TIMER:
@@ -60,13 +109,13 @@ void irq_handler(int vector) {
 }
 
 // Set an IDT entry
-void idt_set_entry(int index, uint64_t handler, uint16_t selector, uint8_t type) {
-    idt[index].offset_low = (handler) & 0xFFFF;
+void idt_set_entry(int index, uintptr_t handler, uint16_t selector, uint8_t type) {
+    idt[index].offset_low = handler & 0xFFFF;
     idt[index].offset_mid = (handler >> 16) & 0xFFFF;
     idt[index].offset_high = (handler >> 32) & 0xFFFFFFFF;
     idt[index].selector = selector;
     idt[index].ist = 0;
-    idt[index].type_attr = type | 0x80;  // Present bit (0x80)
+    idt[index].type_attr = handler ? (type | 0x80) : 0;  // Present only if used
     idt[index].reserved = 0;
 }
 
@@ -99,6 +148,10 @@ void pic_enable_irq(int irq) {
     uint8_t mask = inb(port);
     mask &= ~(1 << (irq % 8));  // Clear bit to enable
     outb(port, mask);
+    if (irq >= 8) {
+        // Slave IRQs reach the CPU through the master's cascade line (IRQ 2)
+        outb(PIC1_DATA, inb(PIC1_DATA) & ~(1 << 2));
+    }
 }
 
 // Disable specific IRQ
@@ -116,29 +169,30 @@ void idt_init(void) {
         idt_set_entry(i, 0, 0, 0);
     }
     
-    // Set up exception handlers (0-31 are exceptions)
-    // For now, set them to dummy handlers
-    // In a real OS, each would have its own handler
-    
-    // Set up IRQ handlers (32-47)
-    // IRQ 0: Timer
-    idt_set_entry(32, (uint64_t)irq_stub_0, 0x08, IDT_GATE_INTERRUPT);
-    
-    // IRQ 1: Keyboard
-    idt_set_entry(33, (uint64_t)irq_stub_1, 0x08, IDT_GATE_INTERRUPT);
-    
-    // IRQ 12: Mouse
-    idt_set_entry(44, (uint64_t)irq_stub_12, 0x08, IDT_GATE_INTERRUPT);
-    
-    // IRQ 14: ATA Primary
-    idt_set_entry(46, (uint64_t)irq_stub_14, 0x08, IDT_GATE_INTERRUPT);
-    
+    // CPU exceptions (vectors 0-31): report and halt instead of triple-faulting
+    for (int i = 0; i < 32; i++) {
+        idt_set_entry(i, isr_stub_table[i], 0x08, IDT_GATE_INTERRUPT);
+    }
+
+    // Crash exceptions run on their own stacks (see gdt.c), so a trashed or
+    // overflowed kernel stack still produces a readable report
+    idt[8].ist = IST_DOUBLE_FAULT;
+    static const int crash_vectors[] = { 2, 12, 13, 14, 18 };   // NMI, #SS, #GP, #PF, #MC
+    for (unsigned i = 0; i < sizeof(crash_vectors) / sizeof(crash_vectors[0]); i++) {
+        idt[crash_vectors[i]].ist = IST_CRASH;
+    }
+
+    // Hardware IRQs 0-15 (vectors 32-47), including spurious IRQ 7 / 15
+    for (int i = 0; i < 16; i++) {
+        idt_set_entry(32 + i, irq_stub_table[i], 0x08, IDT_GATE_INTERRUPT);
+    }
+
     // Initialize PIC
     pic_init();
     
     // Load IDT
     idt_ptr.limit = (sizeof(idt) - 1);
-    idt_ptr.base = (uint64_t)&idt[0];
+    idt_ptr.base = (uintptr_t)&idt[0];
     
     asm volatile("lidt %0" : : "m"(idt_ptr));
     

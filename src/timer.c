@@ -2,7 +2,7 @@
 #include "io.h"
 #include "rtc.h"
 
-timer_t system_timer = {0, 0};
+timer_t system_timer = {0, 0, 0};
 
 /* Initialize PIT (Programmable Interval Timer) for ~100Hz */
 void timer_init(void) {
@@ -21,8 +21,11 @@ void timer_irq_handler(void) {
     system_timer.ticks++;
     system_timer.milliseconds += 10; /* Each tick is ~10ms */
     
-    /* Update system uptime */
-    if (system_timer.ticks % 100 == 0) {
+    /* Update system uptime once a second (~100 ticks at 100 Hz).
+     * A small wraparound counter instead of "% 100" on the tick count. */
+    system_timer.tick_in_second++;
+    if (system_timer.tick_in_second >= 100) {
+        system_timer.tick_in_second = 0;
         rtc_update_uptime();
     }
 }

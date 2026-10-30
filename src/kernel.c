@@ -15,8 +15,16 @@
 #include "timer.h"
 #include "cpu.h"
 #include "meminfo.h"
+#include "heap.h"
+#include "readline.h"
 #include "multiboot.h"
+#include "serial.h"
+#include "gdt.h"
+#include "paging.h"
+#include "pmm.h"
 #include <stdint.h>
+
+static void crash_test(const char *what);
 #include "string.h"
 
 /* Command buffer */
@@ -26,26 +34,6 @@ int cmd_pos = 0;
 
 /* GUI mode flag */
 int gui_mode = 0;
-
-void vga_print_int(int num) {
-    if (num == 0) {
-        vga_print("0");
-        return;
-    }
-    
-    char buffer[32];
-    int i = 0;
-    int negative = (num < 0);
-    if (negative) num = -num;
-    
-    while (num > 0) {
-        buffer[i++] = (num % 10) + '0';
-        num /= 10;
-    }
-    
-    if (negative) vga_print("-");
-    while (i > 0) vga_print(&buffer[--i]);
-}
 
 /* Format time with leading zeros */
 void print_time_component(uint8_t val) {
@@ -57,7 +45,7 @@ void process_command(char *cmd) {
     if (strlen(cmd) == 0) return;
     
     if (strcmp(cmd, "help") == 0) {
-        vga_print("BrackOS v1.7 Commands:\n");
+        vga_print("BrackOS v1.2.0 Commands:\n");
         vga_print("  help       - This message\n");
         vga_print("  echo STR   - Print text\n");
         vga_print("  clear      - Clear screen\n");
@@ -75,6 +63,11 @@ void process_command(char *cmd) {
         vga_print("  shutdown   - Halt\n");
         vga_print("  reboot     - Reboot\n");
         vga_print("  repeat N CMD - Run command N times\n");
+        vga_print("  history    - Show recent commands (history clear)\n");
+        vga_print("  heap       - Kernel heap statistics\n");
+        vga_print("  pmm        - Physical memory (page frame) statistics\n");
+        vga_print("  cache      - Disk cache statistics (cache clear)\n");
+        vga_print("  crashtest X - Deliberately crash: null, stack, write, exec\n");
         vga_print("\n");
         vga_print("Filesystem commands (A: drive):\n");
         vga_print("  ls [PATH]  - List directory\n");
@@ -85,6 +78,42 @@ void process_command(char *cmd) {
         vga_print("  rm FILE    - Delete file\n");
         vga_print("  rmdir DIR  - Delete directory\n");
     }
+    else if (strcmp(cmd, "history") == 0) {
+        for (int i = 0; i < history_count(); i++) {
+            vga_print("  ");
+            vga_print_int(i + 1);
+            vga_print("  ");
+            vga_print(history_get(i));
+            vga_print("\n");
+        }
+    }
+    else if (strcmp(cmd, "history clear") == 0) {
+        history_clear();
+    }
+    else if (strcmp(cmd, "heap") == 0) {
+        heap_stats();
+    }
+    else if (strcmp(cmd, "pmm") == 0) {
+        pmm_print_stats();
+    }
+    else if (strcmp(cmd, "cache") == 0) {
+        uint32_t hits, misses, writes;
+        fat32_cache_stats(&hits, &misses, &writes);
+        vga_print("Disk sector cache (write-through, 256 sectors):\n  Read hits:   ");
+        vga_print_int((int)hits);
+        vga_print("\n  Read misses: ");
+        vga_print_int((int)misses);
+        vga_print("\n  Writes:      ");
+        vga_print_int((int)writes);
+        vga_print("\n");
+    }
+    else if (strcmp(cmd, "cache clear") == 0) {
+        fat32_cache_clear();
+        vga_print("Disk cache cleared\n");
+    }
+    else if (strncmp(cmd, "crashtest ", 10) == 0) {
+        crash_test(&cmd[10]);
+    }
     else if (strncmp(cmd, "echo ", 5) == 0) {
         vga_print(&cmd[5]);
         vga_print("\n");
@@ -93,7 +122,7 @@ void process_command(char *cmd) {
         vga_clear();
     }
     else if (strcmp(cmd, "info") == 0) {
-        vga_print("BrackOS v1.7 Information\n");
+        vga_print("BrackOS v1.2.0 Information\n");
         vga_print("========================\n");
         vga_print("OS: BrackOS Experimental Kernel\n");
         vga_print("Arch: x86-64 (Long Mode)\n");
@@ -144,8 +173,25 @@ void process_command(char *cmd) {
         print_time_component(up.seconds);
         vga_print("\n");
     }
+    else if (strncmp(cmd, "sleep ", 6) == 0) {
+        int seconds = 0;
+        for (size_t i = 6; i < strlen(cmd); i++) {
+            if (cmd[i] >= '0' && cmd[i] <= '9') {
+                seconds = seconds * 10 + (cmd[i] - '0');
+            }
+        }
+        if (seconds > 0) {
+            vga_print("Sleeping ");
+            vga_print_int(seconds);
+            vga_print(" seconds...\n");
+            timer_sleep_ms(seconds * 1000);
+            vga_print("Done.\n");
+        } else {
+            vga_print("Usage: sleep <seconds>\n");
+        }
+    }
     else if (strcmp(cmd, "ver") == 0) {
-        vga_print("BrackOS v1.7 (x86-64)\n");
+        vga_print("BrackOS v1.2.0 (x86-64)\n");
         vga_print("Timer + RTC + Full Clock Functions\n");
     }
     else if (strcmp(cmd, "credits") == 0) {
@@ -291,7 +337,7 @@ void gui_mode_loop(void) {
 void shell_loop(void) {
     vga_clear();
     vga_set_color(VGA_COLOR_CYAN, VGA_COLOR_BLACK);
-    vga_print("BrackOS v1.7 Shell\n");
+    vga_print("BrackOS v1.2.0 Shell\n");
     vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
     vga_print("Type 'help' for commands\n\n");
     
@@ -301,43 +347,11 @@ void shell_loop(void) {
         vga_print(path_display);
         vga_print("> ");
         
-        cmd_pos = 0;
-        memset(cmd_buffer, 0, CMD_BUFFER_SIZE);
-        
-        while (1) {
-            if (keyboard_has_input()) {
-                uint8_t scancode = inb(0x60);
-                
-                if (scancode == 0x1C) { /* Enter */
-                    vga_print("\n");
-                    process_command(cmd_buffer);
-                    break;
-                }
-                else if (scancode == 0x0E && cmd_pos > 0) { /* Backspace */
-                    cmd_pos--;
-                    cmd_buffer[cmd_pos] = 0;
-                    vga_print("\b \b");
-                }
-                else if (scancode < 0x80 && cmd_pos < CMD_BUFFER_SIZE - 1) {
-                    static const char scancode_to_ascii[] = {
-                        0, 0, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0',
-                        '-', '=', 0, 0, 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i',
-                        'o', 'p', '[', ']', 0, 0, 'a', 's', 'd', 'f', 'g', 'h',
-                        'j', 'k', 'l', ';', '\'', '`', 0, '\\', 'z', 'x', 'c',
-                        'v', 'b', 'n', 'm', ',', '.', '/', 0, '*', 0, ' '
-                    };
-                    
-                    if (scancode < sizeof(scancode_to_ascii)) {
-                        char c = scancode_to_ascii[scancode];
-                        if (c > 0) {
-                            cmd_buffer[cmd_pos++] = c;
-                            vga_print(&cmd_buffer[cmd_pos - 1]);
-                        }
-                    }
-                }
-            }
-        }
-        
+        /* Line editor with cursor movement and command history */
+        readline(cmd_buffer, CMD_BUFFER_SIZE);
+        cmd_pos = (int)strlen(cmd_buffer);
+        process_command(cmd_buffer);
+
         if (gui_mode) {
             gui_mode_loop();
         }
@@ -349,9 +363,59 @@ void irq0_handler(void) {
     timer_irq_handler();
 }
 
+/* Deliberate crashes to check the memory protections (each halts the system) */
+static volatile int crash_dummy;
+static volatile int crash_limit = -1;      /* never reached: keeps the recursion honest */
+static uint8_t crash_data[64];
+
+static int crash_recurse(int depth) {
+    volatile char pad[512];
+    pad[0] = (char)depth;
+    if (depth == crash_limit) return 0;
+    return crash_recurse(depth + 1) + pad[0];
+}
+
+static void crash_test(const char *what) {
+    if (strcmp(what, "null") == 0) {
+        crash_dummy = *(volatile int *)0;                 /* read page 0 */
+    } else if (strcmp(what, "stack") == 0) {
+        crash_dummy = crash_recurse(0);                   /* run off the stack */
+    } else if (strcmp(what, "write") == 0) {
+        *(volatile uint8_t *)(uintptr_t)crash_test = 0;   /* write to code */
+    } else if (strcmp(what, "exec") == 0) {
+        ((void (*)(void))(uintptr_t)crash_data)();        /* run data */
+    } else {
+        vga_print("Usage: crashtest null|stack|write|exec\n");
+    }
+}
+
 void kmain(uint32_t mbi_addr) {
+    serial_init();
     multiboot_init(mbi_addr);
     vga_init();
+
+    /* Protection first: our own GDT/TSS (crash stacks), then tighter page
+     * tables (null page, stack guard, W^X). The new GDT has to be live
+     * before paging makes the boot-time GDT in the code section read-only. */
+    gdt_init();
+    paging_init();
+
+    /* Physical memory from the Multiboot2 map, then a heap carved out of it */
+    pmm_init(mbi_addr);
+    {
+        uint32_t heap_frames = 4096;             /* try 16 MB, then 4 MB, then 1 MB */
+        uint64_t heap_phys = 0;
+        while (heap_frames >= 256) {
+            heap_phys = pmm_alloc_frames(heap_frames);
+            if (heap_phys) break;
+            heap_frames /= 4;
+        }
+        if (heap_phys) {
+            heap_init((void *)(uintptr_t)heap_phys, (size_t)heap_frames * PMM_FRAME_SIZE);
+        } else {
+            vga_print("WARNING: no memory available for the kernel heap\n");
+        }
+    }
     keyboard_init();
     idt_init();
     interrupts_enable();

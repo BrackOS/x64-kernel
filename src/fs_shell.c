@@ -10,7 +10,7 @@ static uint8_t sector_buffer[512];
 void fs_shell_init(void) {
     vga_clear();
     vga_set_color(VGA_COLOR_GREEN, VGA_COLOR_BLACK);
-    vga_print("BrackOS v1.5 Filesystem Shell\n");
+    vga_print("BrackOS v1.2.0 Filesystem Shell\n");
     vga_set_color(VGA_COLOR_CYAN, VGA_COLOR_BLACK);
     vga_print("================================\n\n");
     vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
@@ -180,6 +180,30 @@ void fs_ls(const char *path) {
                 vga_print_int(size);
                 vga_print(" bytes)");
             }
+            
+            /* Print modification date from FAT32 entry (bytes 24-25) */
+            uint16_t mod_date = (ent[25] << 8) | ent[24];
+            uint16_t mod_time = (ent[23] << 8) | ent[22];
+            vga_print(" [");
+            uint16_t year = 1980 + (mod_date >> 9);
+            uint8_t month = (mod_date >> 5) & 0x0F;
+            uint8_t day = mod_date & 0x1F;
+            uint8_t hour = (mod_time >> 11) & 0x1F;
+            uint8_t minute = (mod_time >> 5) & 0x3F;
+            vga_print_int(year);
+            vga_putchar('-');
+            if (month < 10) vga_putchar('0');
+            vga_print_int(month);
+            vga_putchar('-');
+            if (day < 10) vga_putchar('0');
+            vga_print_int(day);
+            vga_putchar(' ');
+            if (hour < 10) vga_putchar('0');
+            vga_print_int(hour);
+            vga_putchar(':');
+            if (minute < 10) vga_putchar('0');
+            vga_print_int(minute);
+            vga_print("]");
             vga_print("\n");
             
             count++;

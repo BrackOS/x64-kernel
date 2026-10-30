@@ -4,23 +4,6 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* Memory map tag layout (Multiboot2 spec) */
-typedef struct {
-    uint32_t type;          /* 6 = memory map */
-    uint32_t size;
-    uint32_t entry_size;
-    uint32_t entry_version;
-} mb_mmap_tag_t;
-
-typedef struct {
-    uint64_t base;
-    uint64_t length;
-    uint32_t type;          /* 1 = available RAM */
-    uint32_t reserved;
-} mb_mmap_entry_t;
-
-#define MB_MEM_AVAILABLE  1
-
 static const mb_mmap_tag_t *find_mmap_tag(void) {
     return (const mb_mmap_tag_t *)multiboot_find_tag(MB_TAG_MMAP);
 }

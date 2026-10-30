@@ -71,6 +71,9 @@ typedef struct {
     uint32_t fat_start_sector;
     uint32_t data_start_sector;
     uint32_t root_dir_cluster;
+    uint32_t partition_lba;     // where the volume starts on the disk
+    uint32_t total_clusters;    // data clusters in the volume (valid numbers are 2..total+1)
+    uint32_t next_free_hint;    // where the next free-cluster search starts
     
     file_descriptor_t files[MAX_FILES];
 } fat32_fs_t;
@@ -81,6 +84,10 @@ extern fat32_fs_t fat32_fs;
 int fat32_init(uint32_t drive_lba);
 int fat32_read_sector(uint32_t sector, uint8_t *buffer);
 int fat32_write_sector(uint32_t sector, uint8_t *buffer);
+
+// Sector cache (write-through)
+void fat32_cache_clear(void);
+void fat32_cache_stats(uint32_t *hits, uint32_t *misses, uint32_t *writes);
 
 // Directory operations
 int fat32_list_directory(uint32_t cluster, dir_entry_t *entries, int max_entries);

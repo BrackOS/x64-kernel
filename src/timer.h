@@ -17,6 +17,7 @@
 typedef struct {
     uint64_t ticks;
     uint32_t milliseconds;
+    uint32_t tick_in_second;   /* 0-99; counts up to a full second at ~100 Hz */
 } timer_t;
 
 /* Initialization */

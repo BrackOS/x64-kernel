@@ -23,7 +23,7 @@ void gui_show_desktop(void) {
     
     // Draw "BrackOS" text in taskbar
     uint32_t black = fb_make_color(0, 0, 0);
-    font_draw_string(10, taskbar_y + 12, "BrackOS v1.1", black, white);
+    font_draw_string(10, taskbar_y + 12, "BrackOS v1.2.0", black, white);
 }
 
 void gui_show_info_window(void) {
@@ -39,7 +39,7 @@ void gui_show_info_window(void) {
     
     int x = 320;
     int y = 180;
-    font_draw_string(x, y, "BrackOS v1.1", black, light_gray);
+    font_draw_string(x, y, "BrackOS v1.2.0", black, light_gray);
     y += 12;
     font_draw_string(x, y, "x86-64 Kernel", black, light_gray);
     y += 12;
@@ -99,7 +99,7 @@ void gui_show_about_window(void) {
     
     font_draw_string(x, y, "BrackOS", black, light_gray);
     y += 16;
-    font_draw_string(x, y, "v1.1", black, light_gray);
+    font_draw_string(x, y, "v1.2.0", black, light_gray);
     y += 12;
     font_draw_string(x, y, "Minimal 64-bit OS", black, light_gray);
     y += 12;
