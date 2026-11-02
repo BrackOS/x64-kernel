@@ -1,39 +1,32 @@
-#include <stddef.h>
 #include "mouse.h"
 #include "io.h"
+#include "fb.h"
+#include "input.h"
+#include "idt.h"
+#include "serial.h"
+#include <stdint.h>
 
-// PS/2 Controller ports
-#define PS2_DATA_PORT   0x60
-#define PS2_STATUS_PORT 0x64
-#define PS2_CMD_PORT    0x64
+/* PS/2 controller ports and status bits */
+#define PS2_DATA        0x60
+#define PS2_STATUS_CMD  0x64
+#define PS2_OUT_FULL    0x01     /* a byte is waiting in the data port */
+#define PS2_IN_FULL     0x02     /* controller is not ready for another byte */
+#define PS2_AUX_DATA    0x20     /* the waiting byte came from the mouse */
 
-// PS/2 Status flags
-#define PS2_OUTPUT_BUFFER_FULL 0x01
-#define PS2_INPUT_BUFFER_FULL  0x02
-
-// PS/2 Mouse commands
-#define MOUSE_ENABLE_STREAM    0xF4
-#define MOUSE_DISABLE_STREAM   0xF5
-#define MOUSE_RESET            0xFF
-#define MOUSE_SET_DEFAULTS     0xF6
-#define MOUSE_SET_RESOLUTION   0xE8
-#define MOUSE_SET_SAMPLE_RATE  0xF3
-
-// PS/2 Mouse responses
-#define MOUSE_ACK              0xFA
-#define MOUSE_NACK             0xFE
-#define MOUSE_RESEND           0xFE
+#define MOUSE_ACK       0xFA
 
 mouse_state_t mouse_state = {0};
-mouse_driver_t *active_mouse_driver = NULL;
 
-// Forward declarations
-void ps2_mouse_init(void);
-void ps2_mouse_update(void);
-mouse_state_t* ps2_mouse_get_state(void);
-const char* ps2_mouse_get_name(void);
+static int mouse_ready  = 0;     /* 1 once the mouse is set up */
+static int mouse_irq_on = 0;     /* 1 once IRQ12 is enabled */
+static uint8_t packet[3];
+static int packet_idx = 0;
 
-// PS/2 Mouse driver structure
+static void ps2_mouse_init(void);
+static void ps2_mouse_update(void);
+static mouse_state_t *ps2_mouse_get_state(void);
+static const char *ps2_mouse_get_name(void);
+
 mouse_driver_t ps2_mouse_driver = {
     .init = ps2_mouse_init,
     .update = ps2_mouse_update,
@@ -41,165 +34,141 @@ mouse_driver_t ps2_mouse_driver = {
     .get_name = ps2_mouse_get_name,
 };
 
-// Helper: Wait for data to be available
-static void ps2_wait_read(void) {
-    for (int i = 0; i < 100000; i++) {
-        if (inb(PS2_STATUS_PORT) & PS2_OUTPUT_BUFFER_FULL) {
-            return;
-        }
+mouse_driver_t *active_mouse_driver = &ps2_mouse_driver;
+
+/* ---- Talking to the controller ---- */
+
+static int wait_write(void) {
+    for (int t = 100000; t > 0; t--) {
+        if (!(inb(PS2_STATUS_CMD) & PS2_IN_FULL)) return 0;
     }
+    return -1;
 }
 
-// Helper: Wait for input buffer to be ready
-static void ps2_wait_write(void) {
-    for (int i = 0; i < 100000; i++) {
-        if (!(inb(PS2_STATUS_PORT) & PS2_INPUT_BUFFER_FULL)) {
-            return;
-        }
+static int wait_read(void) {
+    for (int t = 100000; t > 0; t--) {
+        if (inb(PS2_STATUS_CMD) & PS2_OUT_FULL) return 0;
     }
+    return -1;
 }
 
-// Helper: Read byte from PS/2
-static uint8_t ps2_read_byte(void) {
-    ps2_wait_read();
-    return inb(PS2_DATA_PORT);
+/* Send a command byte to the mouse itself (not the keyboard). 0 if it ACKs. */
+static int mouse_send(uint8_t byte) {
+    if (wait_write()) return -1;
+    outb(PS2_STATUS_CMD, 0xD4);          /* "next byte goes to the mouse" */
+    if (wait_write()) return -1;
+    outb(PS2_DATA, byte);
+    if (wait_read()) return -1;
+    return (inb(PS2_DATA) == MOUSE_ACK) ? 0 : -1;
 }
 
-// Helper: Write byte to PS/2
-static void ps2_write_byte(uint8_t byte) {
-    ps2_wait_write();
-    outb(PS2_DATA_PORT, byte);
-}
+static void ps2_mouse_init(void) {
+    if (mouse_ready) return;
 
-// Helper: Send command and wait for ACK
-static int ps2_send_command(uint8_t cmd) {
-    ps2_write_byte(cmd);
-    uint8_t response = ps2_read_byte();
-    return (response == MOUSE_ACK) ? 0 : -1;
-}
+    while (inb(PS2_STATUS_CMD) & PS2_OUT_FULL) (void)inb(PS2_DATA);   /* flush */
 
-// Initialize PS/2 mouse
-void ps2_mouse_init(void) {
-    // Reset mouse
-    if (ps2_send_command(MOUSE_RESET) != 0) {
+    if (wait_write()) return;
+    outb(PS2_STATUS_CMD, 0xA8);          /* enable the mouse port */
+
+    if (wait_write()) return;
+    outb(PS2_STATUS_CMD, 0x20);          /* read the controller configuration */
+    if (wait_read()) return;
+    uint8_t cfg = inb(PS2_DATA);
+    cfg |= 0x02;                         /* mouse interrupt on */
+    cfg &= (uint8_t)~0x20;               /* mouse clock on */
+    if (wait_write()) return;
+    outb(PS2_STATUS_CMD, 0x60);          /* write the configuration back */
+    if (wait_write()) return;
+    outb(PS2_DATA, cfg);
+
+    if (mouse_send(0xF6) != 0 || mouse_send(0xF4) != 0) {    /* defaults, then start reporting */
+        serial_print("MOUSE: no PS/2 mouse answered\n");
         return;
     }
-    
-    // Wait for self-test
-    uint8_t test_result = ps2_read_byte();
-    (void)test_result;  // Suppress unused warning
-    
-    // Set to defaults
-    ps2_send_command(MOUSE_SET_DEFAULTS);
-    ps2_read_byte();  // Read response
-    
-    // Set sample rate (100 Hz)
-    ps2_send_command(MOUSE_SET_SAMPLE_RATE);
-    ps2_read_byte();
-    ps2_write_byte(100);
-    ps2_read_byte();
-    
-    // Set resolution (1 count per mm)
-    ps2_send_command(MOUSE_SET_RESOLUTION);
-    ps2_read_byte();
-    ps2_write_byte(0);  // 0 = 1 count per mm
-    ps2_read_byte();
-    
-    // Enable data reporting
-    ps2_send_command(MOUSE_ENABLE_STREAM);
-    ps2_read_byte();
-    
-    // Initialize state
-    mouse_state.x = 512;  // Center of 1024×768
-    mouse_state.y = 384;
-    mouse_state.buttons = 0;
+
+    mouse_state.x = fb.available ? (int)fb.width / 2 : 512;
+    mouse_state.y = fb.available ? (int)fb.height / 2 : 384;
+    packet_idx = 0;
+    mouse_ready = 1;
+    mouse_irq_on = 1;
+    pic_enable_irq(12);
 }
 
-// Update mouse state from PS/2 packets
-void ps2_mouse_update(void) {
-    // Check if data available
-    if (!(inb(PS2_STATUS_PORT) & PS2_OUTPUT_BUFFER_FULL)) {
-        return;
-    }
-    
-    // Read 3-byte packet
-    static uint8_t packet[3];
-    static int packet_index = 0;
-    
-    uint8_t byte = inb(PS2_DATA_PORT);
-    
-    // First byte should have bit 3 set (always 1)
-    if (packet_index == 0 && !(byte & 0x08)) {
-        return;  // Discard invalid packet start
-    }
-    
-    packet[packet_index] = byte;
-    packet_index++;
-    
-    if (packet_index < 3) {
-        return;  // Wait for full packet
-    }
-    
-    packet_index = 0;  // Reset for next packet
-    
-    // Parse packet
-    uint8_t status = packet[0];
-    int8_t dx = (int8_t)packet[1];
-    int8_t dy = (int8_t)packet[2];
-    
-    // Update button states
-    mouse_state.buttons = status & 0x07;
-    mouse_state.left_pressed = (status & 0x01) ? 1 : 0;
-    mouse_state.right_pressed = (status & 0x02) ? 1 : 0;
-    mouse_state.middle_pressed = (status & 0x04) ? 1 : 0;
-    
-    // Update relative movement
+/* ---- Packets ---- */
+
+static void handle_byte(uint8_t b) {
+    if (packet_idx == 0 && !(b & 0x08)) return;     /* not a first byte: out of sync, skip */
+    packet[packet_idx++] = b;
+    if (packet_idx < 3) return;
+    packet_idx = 0;
+
+    if (packet[0] & 0xC0) return;                   /* overflow: discard this packet */
+
+    /* 9-bit signed movement: the sign bits live in the first byte */
+    int dx = (int)packet[1] - (int)((packet[0] << 4) & 0x100);
+    int dy = (int)packet[2] - (int)((packet[0] << 3) & 0x100);
+    dy = -dy;                                       /* PS/2 counts up as positive; the screen counts down */
+
+    int w = fb.available ? (int)fb.width  : 1024;
+    int h = fb.available ? (int)fb.height : 768;
+    int x = mouse_state.x + dx;
+    int y = mouse_state.y + dy;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x > w - 1) x = w - 1;
+    if (y > h - 1) y = h - 1;
+
     mouse_state.dx = dx;
     mouse_state.dy = dy;
-    
-    // Update absolute position with bounds checking
-    int new_x = mouse_state.x + dx;
-    int new_y = mouse_state.y + dy;
-    
-    // Clamp to screen bounds (1024×768)
-    if (new_x < 0) new_x = 0;
-    if (new_x >= 1024) new_x = 1023;
-    if (new_y < 0) new_y = 0;
-    if (new_y >= 768) new_y = 767;
-    
-    mouse_state.x = new_x;
-    mouse_state.y = new_y;
+    mouse_state.x = x;
+    mouse_state.y = y;
+    mouse_state.buttons = packet[0] & 0x07;
+    mouse_state.left_pressed   = (packet[0] & 0x01) != 0;
+    mouse_state.right_pressed  = (packet[0] & 0x02) != 0;
+    mouse_state.middle_pressed = (packet[0] & 0x04) != 0;
+
+    input_push_mouse(x, y, dx, dy, mouse_state.buttons);
 }
 
-// Get current mouse state
-mouse_state_t* ps2_mouse_get_state(void) {
-    return &mouse_state;
+static void drain(void) {
+    for (;;) {
+        uint8_t st = inb(PS2_STATUS_CMD);
+        if (!(st & PS2_OUT_FULL) || !(st & PS2_AUX_DATA)) break;
+        handle_byte(inb(PS2_DATA));
+    }
 }
 
-// Get driver name
-const char* ps2_mouse_get_name(void) {
-    return "PS/2 Mouse";
+/* IRQ12 */
+void mouse_irq_handler(void) {
+    drain();
 }
 
-// Universal mouse interface (can be switched to USB later)
+/* Polling fallback: only used while the interrupt is not on */
+static void ps2_mouse_update(void) {
+    if (mouse_ready && !mouse_irq_on) drain();
+}
+
+static mouse_state_t *ps2_mouse_get_state(void) { return &mouse_state; }
+static const char *ps2_mouse_get_name(void) { return "PS/2 Mouse"; }
+
+int mouse_irq_active(void) {
+    return mouse_irq_on;
+}
+
+/* ---- Universal interface ---- */
+
 void mouse_init(void) {
-    active_mouse_driver = &ps2_mouse_driver;
-    active_mouse_driver->init();
+    if (active_mouse_driver && active_mouse_driver->init) active_mouse_driver->init();
 }
 
 void mouse_update(void) {
-    if (active_mouse_driver) {
-        active_mouse_driver->update();
-    }
+    if (active_mouse_driver && active_mouse_driver->update) active_mouse_driver->update();
 }
 
-mouse_state_t* mouse_get(void) {
-    return &mouse_state;
+mouse_state_t *mouse_get(void) {
+    return active_mouse_driver ? active_mouse_driver->get_state() : &mouse_state;
 }
 
-const char* mouse_get_driver_name(void) {
-    if (active_mouse_driver) {
-        return active_mouse_driver->get_name();
-    }
-    return "No mouse";
+const char *mouse_get_driver_name(void) {
+    return active_mouse_driver ? active_mouse_driver->get_name() : "none";
 }

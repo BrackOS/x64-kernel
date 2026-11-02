@@ -20,11 +20,23 @@
 #include "multiboot.h"
 #include "serial.h"
 #include "gdt.h"
+#include "input.h"
+#include "vmm.h"
+#include "fpu.h"
+#include "sched.h"
+#include "syscall.h"
+#include "process.h"
+#include "embedded.h"
+#include "apic.h"
+#include "blockdev.h"
+#include "brkf_kernel.h"
+#include "brkf_shell.h"
 #include "paging.h"
 #include "pmm.h"
 #include <stdint.h>
 
 static void crash_test(const char *what);
+static void cmd_run(const char *args);
 #include "string.h"
 
 /* Command buffer */
@@ -45,7 +57,7 @@ void process_command(char *cmd) {
     if (strlen(cmd) == 0) return;
     
     if (strcmp(cmd, "help") == 0) {
-        vga_print("BrackOS v1.2.0 Commands:\n");
+        vga_print("BrackOS v1.4.0 Commands:\n");
         vga_print("  help       - This message\n");
         vga_print("  echo STR   - Print text\n");
         vga_print("  clear      - Clear screen\n");
@@ -66,6 +78,11 @@ void process_command(char *cmd) {
         vga_print("  history    - Show recent commands (history clear)\n");
         vga_print("  heap       - Kernel heap statistics\n");
         vga_print("  pmm        - Physical memory (page frame) statistics\n");
+        vga_print("  brkf ...   - BRKF filesystem on the second disk (brkf help)\n");
+        vga_print("  run X args - Run a program in user mode (Ctrl-C stops it)\n");
+        vga_print("  progs      - List built-in programs\n");
+        vga_print("  ps / kill  - List processes / kill a user process\n");
+        vga_print("  apic       - Interrupt controller (APIC) information\n");
         vga_print("  cache      - Disk cache statistics (cache clear)\n");
         vga_print("  crashtest X - Deliberately crash: null, stack, write, exec\n");
         vga_print("\n");
@@ -92,6 +109,31 @@ void process_command(char *cmd) {
     }
     else if (strcmp(cmd, "heap") == 0) {
         heap_stats();
+    }
+    else if (strncmp(cmd, "run ", 4) == 0) {
+        cmd_run(&cmd[4]);
+    }
+    else if (strcmp(cmd, "brkf") == 0) {
+        brkf_shell_command("");
+    }
+    else if (strncmp(cmd, "brkf ", 5) == 0) {
+        brkf_shell_command(&cmd[5]);
+    }
+    else if (strcmp(cmd, "ps") == 0) {
+        task_print_list();
+    }
+    else if (strcmp(cmd, "progs") == 0) {
+        vga_print("Built-in programs (run <name> [args]):\n");
+        embedded_list();
+    }
+    else if (strncmp(cmd, "kill ", 5) == 0) {
+        int pid = 0;
+        for (const char *p = &cmd[5]; *p >= '0' && *p <= '9'; p++) pid = pid * 10 + (*p - '0');
+        if (sched_kill(pid) == 0) vga_print("Killed\n");
+        else vga_print("No such user process\n");
+    }
+    else if (strcmp(cmd, "apic") == 0) {
+        apic_print_info();
     }
     else if (strcmp(cmd, "pmm") == 0) {
         pmm_print_stats();
@@ -122,7 +164,7 @@ void process_command(char *cmd) {
         vga_clear();
     }
     else if (strcmp(cmd, "info") == 0) {
-        vga_print("BrackOS v1.2.0 Information\n");
+        vga_print("BrackOS v1.4.0 Information\n");
         vga_print("========================\n");
         vga_print("OS: BrackOS Experimental Kernel\n");
         vga_print("Arch: x86-64 (Long Mode)\n");
@@ -191,7 +233,7 @@ void process_command(char *cmd) {
         }
     }
     else if (strcmp(cmd, "ver") == 0) {
-        vga_print("BrackOS v1.2.0 (x86-64)\n");
+        vga_print("BrackOS v1.4.0 (x86-64)\n");
         vga_print("Timer + RTC + Full Clock Functions\n");
     }
     else if (strcmp(cmd, "credits") == 0) {
@@ -301,35 +343,50 @@ void process_command(char *cmd) {
 }
 
 void gui_mode_loop(void) {
-    fb_init();
+    if (!fb.available) {
+        vga_print("GUI: GRUB did not give us a graphics mode (framebuffer unavailable)\n");
+        gui_mode = 0;
+        return;
+    }
+
     font_init();
     window_init();
-    mouse_init();
-    
-    fb_fill_rect(0, 0, 1024, 768, 0x78ACD4);
-    fb_fill_rect(0, 728, 1024, 40, 0xFFFFFF);
-    
+    cursor_init();
+
+    uint32_t sky   = fb_make_color(120, 172, 212);
+    uint32_t white = fb_make_color(255, 255, 255);
+    uint32_t black = fb_make_color(0, 0, 0);
+    int bar_y = (int)fb.height - 40;
+
+    fb_clear(sky);
+    fb_fill_rect(0, bar_y, (int)fb.width, 40, white);
+    font_draw_string(10, bar_y + 16, "BrackOS v1.4.0   -   Q or Esc returns to the shell", black, white);
+
     window_t info_win = {
         .x = 50, .y = 50, .width = 400, .height = 200,
         .title = "System Info", .visible = 1, .z_order = 0
     };
     window_init_buffer(&info_win);
     window_draw(&info_win);
-    
-    vga_print("GUI mode: Press Q to exit\n");
-    
-    while (1) {
-        mouse_update();
-        cursor_draw(mouse_get()->x, mouse_get()->y);
-        
-        if (keyboard_has_input()) {
-            uint8_t scancode = inb(0x60);
-            if (scancode == 0x10) {
-                break;
-            }
+
+    cursor_forget();                         /* the screen was just redrawn */
+    cursor_draw(mouse_get()->x, mouse_get()->y);
+    fb_present();
+
+    /* Event loop: sleeps until the keyboard or mouse interrupt queues something */
+    for (;;) {
+        input_event_t ev;
+        input_wait(&ev);
+
+        if (ev.type == INPUT_KEY && (ev.key == 'q' || ev.key == 'Q' || ev.key == 27)) {
+            break;
+        }
+        if (ev.type == INPUT_MOUSE_MOVE) {
+            cursor_update(ev.x, ev.y);
         }
     }
-    
+
+    cursor_hide();
     gui_mode = 0;
     vga_clear();
 }
@@ -337,7 +394,7 @@ void gui_mode_loop(void) {
 void shell_loop(void) {
     vga_clear();
     vga_set_color(VGA_COLOR_CYAN, VGA_COLOR_BLACK);
-    vga_print("BrackOS v1.2.0 Shell\n");
+    vga_print("BrackOS v1.4.0 Shell\n");
     vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
     vga_print("Type 'help' for commands\n\n");
     
@@ -348,6 +405,7 @@ void shell_loop(void) {
         vga_print("> ");
         
         /* Line editor with cursor movement and command history */
+        task_reap_zombies();                  /* collect any exited background tasks */
         readline(cmd_buffer, CMD_BUFFER_SIZE);
         cmd_pos = (int)strlen(cmd_buffer);
         process_command(cmd_buffer);
@@ -361,6 +419,46 @@ void shell_loop(void) {
 /* IRQ0 handler - installed by IDT */
 void irq0_handler(void) {
     timer_irq_handler();
+}
+
+/* run <program> [args]: start a user process and wait for it */
+static void cmd_run(const char *args) {
+    char buf[128];
+    strncpy_safe(buf, args, sizeof(buf));
+    char *argv[MAX_ARGS];
+    int argc = 0;
+    for (char *p = buf; *p && argc < MAX_ARGS - 1; ) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        argv[argc++] = p;
+        while (*p && *p != ' ') p++;
+        if (*p) *p++ = '\0';
+    }
+    if (argc == 0) { vga_print("Usage: run <program> [arguments]   (try: progs)\n"); return; }
+
+    int pid = proc_spawn(argv[0], argc, argv, 1);
+    if (pid < 0) return;
+
+    input_take_interrupt();                       /* forget any old Ctrl-C */
+    int status = 0;
+    for (;;) {
+        int r = task_wait(pid, &status, 1);
+        if (r != 0) { if (r < 0) status = 0; break; }
+        if (input_take_interrupt()) {
+            vga_print("^C\n");
+            sched_kill(pid);
+        }
+        sched_sleep_ticks(1);                     /* let the program run; look again in 10 ms */
+    }
+    if (status & 0x7F) {
+        vga_print("[terminated by signal ");
+        vga_print_int(status & 0x7F);
+        vga_print("]\n");
+    } else if ((status >> 8) != 0) {
+        vga_print("[exit code ");
+        vga_print_int((status >> 8) & 0xFF);
+        vga_print("]\n");
+    }
 }
 
 /* Deliberate crashes to check the memory protections (each halts the system) */
@@ -394,6 +492,13 @@ void kmain(uint32_t mbi_addr) {
     multiboot_init(mbi_addr);
     vga_init();
 
+    /* If GRUB set up a graphics mode, the console draws on the framebuffer
+     * from here on (before this point, text goes to the invisible VGA text
+     * buffer and to the serial port). */
+    if (fb_init()) {
+        vga_use_framebuffer();
+    }
+
     /* Protection first: our own GDT/TSS (crash stacks), then tighter page
      * tables (null page, stack guard, W^X). The new GDT has to be live
      * before paging makes the boot-time GDT in the code section read-only. */
@@ -416,6 +521,16 @@ void kmain(uint32_t mbi_addr) {
             vga_print("WARNING: no memory available for the kernel heap\n");
         }
     }
+    fb_enable_backbuffer();                      /* needs the heap */
+
+    /* Multitasking: address spaces, SSE for user code, the scheduler (the
+     * boot context becomes task 1, "kshell"), and the SYSCALL instruction */
+    vmm_init();
+    fpu_init();
+    sched_init();
+    syscall_init();
+
+    input_init();
     keyboard_init();
     idt_init();
     interrupts_enable();
@@ -425,8 +540,20 @@ void kmain(uint32_t mbi_addr) {
     pic_enable_irq(0); /* Enable timer interrupt */
     rtc_init();
     
+    /* Switch from the legacy PIC to the APIC if the machine supports it */
+    if (!multiboot_cmdline_has("noapic")) {
+        apic_init();
+    }
+
     recovery_init();
+
+    /* Keyboard and mouse now feed the event queue from their interrupts */
+    mouse_init();
+    keyboard_enable_irq();
     
+    blk_init();
+    brkf_boot_mount();
+
     if (fat32_init(0) != 0) {
         vga_set_color(VGA_COLOR_YELLOW, VGA_COLOR_BLACK);
         vga_print("Warning: FAT32 init failed (no disk?)\n");

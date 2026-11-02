@@ -22,6 +22,13 @@ extern char stack_guard[];
 
 static uint64_t pt_low[LOW_PTS][512] __attribute__((aligned(4096)));
 
+static uint64_t nx_bit_value = 0;
+
+/* NX bit for page table entries, or 0 if the CPU does not support it */
+uint64_t paging_nx_bit(void) {
+    return nx_bit_value;
+}
+
 static int cpu_has_nx(void) {
     uint32_t a, b, c, d;
     __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x80000000u));
@@ -45,6 +52,7 @@ void paging_init(void) {
         write_msr(0xC0000080, read_msr(0xC0000080) | (1u << 11));   /* EFER.NXE */
         nx = PTE_NX;
     }
+    nx_bit_value = nx;
 
     /* Default for the first 4 MB: present, writable, not executable */
     for (int t = 0; t < LOW_PTS; t++) {
@@ -84,4 +92,19 @@ void paging_init(void) {
     uint64_t cr3;
     __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
     __asm__ volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
+}
+
+/* Make the 2 MB page that contains a device's registers uncached (the
+ * local APIC and I/O APIC need this; cached register accesses are wrong on
+ * real hardware). Only for addresses in the first 4 GB, outside the first
+ * 4 MB (which uses 4 KB pages). Returns 0 on success. */
+int paging_make_uncached(uint64_t phys) {
+    if (phys >= 0x100000000ULL || phys < (uint64_t)LOW_MB * 1024 * 1024) return -1;
+    uint64_t *pde = &pdt[phys >> 21];
+    if (!(*pde & PTE_P) || !(*pde & PTE_PS)) return -1;
+    *pde |= (1ULL << 3) | (1ULL << 4);          /* PWT | PCD */
+    uint64_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    __asm__ volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
+    return 0;
 }

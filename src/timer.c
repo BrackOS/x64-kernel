@@ -1,6 +1,7 @@
 #include "timer.h"
 #include "io.h"
 #include "rtc.h"
+#include "sched.h"
 
 timer_t system_timer = {0, 0, 0};
 
@@ -49,5 +50,8 @@ void timer_sleep_ms(uint32_t ms) {
 /* Sleep for specified ticks */
 void timer_sleep_ticks(uint64_t ticks) {
     uint64_t target = system_timer.ticks + ticks;
-    while (system_timer.ticks < target);
+    while (system_timer.ticks < target) {
+        if (sched_ready_count() > 0) sched_yield();
+        else __asm__ volatile("hlt");      /* interrupts are on: the next tick wakes us */
+    }
 }

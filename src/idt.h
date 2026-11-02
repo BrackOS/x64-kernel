@@ -2,6 +2,7 @@
 #define IDT_H
 
 #include <stdint.h>
+#include "trap.h"
 
 // IDT Gate Types
 #define IDT_GATE_INTERRUPT 0x0E
@@ -25,8 +26,8 @@ typedef struct {
 
 // Exception handlers
 void idt_init(void);
-void exception_handler(uintptr_t vector, uintptr_t error_code, uintptr_t ip);
-void irq_handler(uintptr_t vector);
+void exception_handler(uintptr_t vector, uintptr_t error_code, uintptr_t ip, trap_frame_t *frame);
+void irq_handler(uintptr_t vector, trap_frame_t *frame);
 void idt_set_entry(int index, uintptr_t handler, uint16_t selector, uint8_t type);
 
 // Interrupt numbers

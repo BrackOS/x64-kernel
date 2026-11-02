@@ -10,7 +10,7 @@ static uint8_t sector_buffer[512];
 void fs_shell_init(void) {
     vga_clear();
     vga_set_color(VGA_COLOR_GREEN, VGA_COLOR_BLACK);
-    vga_print("BrackOS v1.2.0 Filesystem Shell\n");
+    vga_print("BrackOS v1.4.0 Filesystem Shell\n");
     vga_set_color(VGA_COLOR_CYAN, VGA_COLOR_BLACK);
     vga_print("================================\n\n");
     vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);

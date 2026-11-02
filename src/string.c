@@ -54,3 +54,11 @@ int memcmp(const void *a, const void *b, size_t n) {
     }
     return 0;
 }
+
+/* Copy at most n-1 characters and always terminate */
+void strncpy_safe(char *dst, const char *src, size_t n) {
+    if (n == 0) return;
+    size_t i = 0;
+    for (; i + 1 < n && src[i]; i++) dst[i] = src[i];
+    dst[i] = '\0';
+}

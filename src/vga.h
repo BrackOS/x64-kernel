@@ -32,5 +32,7 @@ void vga_print_int(int num);
 void vga_print_hex(uintptr_t v);
 void vga_set_color(uint8_t fg, uint8_t bg);
 void vga_backspace(void);
+int  vga_use_framebuffer(void);   /* switch to the graphics console; 0 if unavailable */
+int  vga_is_graphics(void);
 
 #endif

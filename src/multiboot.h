@@ -7,6 +7,8 @@
 #define MB_TAG_END          0
 #define MB_TAG_MMAP         6
 #define MB_TAG_FRAMEBUFFER  8
+#define MB_TAG_ACPI_OLD     14   /* copy of the ACPI 1.0 RSDP */
+#define MB_TAG_ACPI_NEW     15   /* copy of the ACPI 2.0+ RSDP */
 
 /* Memory map tag layout (Multiboot2 spec) */
 typedef struct {
@@ -24,6 +26,8 @@ typedef struct {
 } mb_mmap_entry_t;
 
 #define MB_MEM_AVAILABLE  1
+
+int multiboot_cmdline_has(const char *word);   /* word on the GRUB command line? */
 
 /* Store the Multiboot2 info pointer that GRUB passed to the kernel */
 void multiboot_init(uint32_t mbi_addr);

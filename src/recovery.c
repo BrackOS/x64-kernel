@@ -15,7 +15,7 @@ static recovery_state_t current_state = {
 void recovery_init(void) {
     vga_clear();
     vga_set_color(VGA_COLOR_YELLOW, VGA_COLOR_BLACK);
-    vga_print("BrackOS v1.2.0 Recovery System\n");
+    vga_print("BrackOS v1.4.0 Recovery System\n");
     vga_print("=============================\n\n");
     
     /* Check for repeated failures */

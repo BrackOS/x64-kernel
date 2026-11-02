@@ -17,6 +17,10 @@
 #define KEY_DELETE 0x1E
 
 void keyboard_init(void);
+void keyboard_enable_irq(void);      /* switch from polling to the IRQ1 handler */
+void keyboard_irq_handler(void);     /* called from the IRQ1 interrupt */
+void keyboard_poll(void);            /* poll by hand (no-op once IRQ1 is on) */
+int  keyboard_irq_active(void);
 int keyboard_has_input(void);
 char keyboard_getchar(void);
 

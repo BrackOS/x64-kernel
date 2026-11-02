@@ -1,0 +1,162 @@
+BRKF - the BrackOS filesystem, on-disk format version 1.0
+==========================================================
+
+Goals: simple enough to implement in a weekend on any operating system, safe
+against silent corruption (checksums), no hidden limits that surprise you
+(64-bit sizes, 255-byte UTF-8 names, nanosecond timestamps), and POSIX-shaped
+so it maps directly onto Linux (FUSE or a kernel module) and BrackOS itself.
+Not goals in v1: journaling, extents, compression, encryption, multiple block
+groups. The format has room for them (feature flags, see below).
+
+The reference implementation is brkf/brkf.c (portable C, no OS dependencies).
+When this text and the code disagree, tell the author: both are meant to match.
+
+1. Conventions
+--------------
+* All integers are little endian. Offsets below are in bytes.
+* The block size is 4096 bytes. Block numbers are 32 bits (largest volume 16 TB).
+* Blocks are numbered from 0 at the start of the volume (the start of the
+  partition or image). Block 0 is reserved for boot code and is never touched
+  by the filesystem.
+* Inode numbers start at 1. Inode 0 means "no inode". The root directory is
+  inode 1.
+* CRC-32 means the common CRC-32 (IEEE 802.3, reflected polynomial 0xEDB88320,
+  initial value 0xFFFFFFFF, final XOR 0xFFFFFFFF), the same as zlib/gzip.
+* Times are unsigned 64-bit nanoseconds since 1970-01-01 00:00:00 UTC.
+* Names are byte strings (UTF-8 recommended), 1 to 255 bytes, never containing
+  '/' or NUL. Comparison is exact bytes: names are case sensitive.
+
+2. Volume layout
+----------------
+  block 0                     boot area (reserved)
+  block 1                     superblock
+  block 2 ...                 inode bitmap       (inode_bitmap_blocks blocks)
+  then                        block bitmap       (block_bitmap_blocks blocks)
+  then                        inode table        (inode_table_blocks blocks)
+  data_start ...              data blocks (file data, directories, indirect blocks)
+  last block (block_count-1)  backup copy of the superblock
+
+Bitmaps: bit n of a bitmap is bit (n % 8) of byte (n / 8). 1 = in use.
+The inode bitmap has one bit per inode (bit 0 = inode 1). The block bitmap has
+one bit per block of the whole volume: the metadata blocks, the backup
+superblock and every bit past the end of the volume are set to 1 permanently.
+Bits past the last inode in the inode bitmap are also set to 1.
+
+3. Superblock (256 bytes at offset 0 of block 1; the rest of the block is zero)
+-----------------------------------------------------------------------------
+  off size  field
+    0   4   magic              0x464B5242, which is the bytes 'B' 'R' 'K' 'F'
+    4   2   version_major      1   (a mount must refuse a different major version)
+    6   2   version_minor      0
+    8   4   block_size         4096
+   12   4   inode_size         256
+   16   8   block_count        blocks in the volume (including block 0)
+   24   4   inode_count        multiple of 16
+   28   4   root_ino           1
+   32   8   free_blocks        advisory: may be stale after a crash; fsck recomputes
+   40   4   free_inodes        advisory, same
+   44   4   state              1 = clean, 2 = dirty (mounted or not cleanly unmounted)
+   48   4   incompat           feature flags a driver must understand to mount at all (0 in v1)
+   52   4   compat             feature flags that are safe to ignore (0 in v1)
+   56   4   rocompat           features a driver must understand to write (0 in v1)
+   60   4   mount_count
+   64   8   inode_bitmap_start (block number)
+   72   8   block_bitmap_start
+   80   8   inode_table_start
+   88   8   data_start         first data block
+   96   4   inode_bitmap_blocks
+  100   4   block_bitmap_blocks
+  104   4   inode_table_blocks
+  108   4   reserved (0)
+  112   8   created_ns
+  120   8   last_mount_ns
+  128  16   uuid
+  144  32   label              UTF-8, NUL padded
+  176  76   reserved (0)
+  252   4   crc32              CRC-32 of bytes 0..251
+
+Mounting: read block 1; if the magic or CRC is wrong, read the backup in the
+last block (find it from block_count if the primary at least has the right
+magic). Refuse if version_major differs, incompat has unknown bits, or the
+geometry is inconsistent. A writing mount sets state=2 (and writes both copies)
+before changing anything; a clean unmount stores updated counters and state=1.
+If state is 2 when a volume is mounted, it was not cleanly unmounted: run fsck.
+
+4. Inodes (256 bytes each, in the inode table; inode n is at byte
+   ((n-1) mod 16) * 256 of block inode_table_start + (n-1)/16)
+-----------------------------------------------------------------
+  off size  field
+    0   2   mode        POSIX mode: type in the top 4 bits (0x8000 file,
+                        0x4000 directory, 0xA000 symlink), permissions in the low 12
+    2   2   flags       bit 0: inline symlink (see below)
+    4   4   uid
+    8   4   gid
+   12   4   nlink       directory entries pointing at this inode
+   16   8   size        bytes
+   24   8   blocks      4 KB blocks owned (data + indirect blocks)
+   32   8   atime       (not updated on reads in v1: "noatime")
+   40   8   mtime
+   48   8   ctime
+   56   8   crtime      creation time
+   64  48   direct[12]  block numbers of file blocks 0..11 (0 = hole)
+  112   4   indirect    block of 1024 block numbers: file blocks 12 .. 1035
+  116   4   dindirect   points to 1024 indirect blocks
+  120   4   tindirect   points to 1024 double-indirect blocks
+  124   4   generation  changes every time the inode number is reused
+  128 124   reserved (0)
+  252   4   crc32       CRC-32 of bytes 0..251
+
+A free inode slot is 256 zero bytes (mode 0 and crc32 0). Any other inode whose
+checksum is wrong is damaged and must not be used.
+A block number of 0 inside a file means a hole: reads return zeros, nothing is
+allocated until written, so files can be sparse. Largest file: about 4 TB.
+Newly allocated blocks (data, directory and indirect) are zero-filled.
+
+Symlinks: type 0xA000, size = target length (1..4095 bytes). If the target is at
+most 60 bytes it is stored inline in the 60 bytes starting at offset 64 and
+flags bit 0 is set. Longer targets are stored like file data.
+
+5. Directories
+--------------
+A directory is a file (size a multiple of 4096) whose blocks hold entries:
+  off size  field
+    0   4   inode      0 = unused slot
+    4   2   rec_len    distance to the next entry; a multiple of 4; entries
+                        never cross a block boundary; the last entry of a block
+                        extends to the end of the block
+    6   1   name_len
+    7   1   file_type  1 regular, 2 directory, 7 symlink
+    8   n   name       name_len bytes, not NUL terminated
+An entry's minimum rec_len is 8 + name_len rounded up to a multiple of 4. Free
+space is kept inside rec_len; deleting an entry merges its space into the
+previous entry of the block (or sets inode to 0 if it is the first).
+Every directory contains "." (itself) and ".." (its parent; the root's parent
+is the root), stored as ordinary entries, first and second in block 0.
+nlink of a directory = 2 + the number of subdirectories (its entry in the parent,
+its own ".", and one ".." per subdirectory).
+No hash tree in v1: lookups scan linearly (fine up to a few thousand names).
+
+6. Allocation and crash behaviour
+---------------------------------
+There is no journal. Writers follow an order that never leaves a name pointing at
+free space: create = inode, then data, then the directory entry; delete =
+directory entry first, then blocks and inode; link = raise nlink, then add the
+entry. A crash can therefore leak an inode or blocks (fsck frees them) but
+should not cause data loss in other files. fsck rebuilds the bitmaps and the
+counters from the tree. Counters in the superblock are advisory.
+
+7. What fsck checks
+-------------------
+Superblock checksum and geometry; every reachable inode's checksum and type;
+directory structure (".", "..", entry types, one parent per directory); every
+block is inside the data area and used by exactly one inode; "blocks" counts;
+link counts; inode and block bitmaps; free counters; leaked inodes.
+
+8. Using BRKF on other systems
+------------------------------
+* Partition type: MBR has no assigned type byte for BRKF (0x83, "Linux", is fine).
+  For GPT use the type GUID 39DFA884-7431-47F5-8CF5-65F516F2238E (generated for this project).
+* Linux: tools/mount.brkf (FUSE) mounts it today; a kernel module would implement
+  the same operations. Windows: WinFsp or Dokan driver around brkf/brkf.c.
+  Without a driver, tools/brkf can copy files in and out of an image.
+  See the README for details.

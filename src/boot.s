@@ -40,9 +40,17 @@ multiboot_header_start:
     dd 12
     dd _start
 
-    ; (No framebuffer request tag: GRUB leaves the screen in standard
-    ; VGA text mode at boot, which is what the shell writes to. The GUI
-    ; command switches to graphics mode later, on demand.)
+    ; Framebuffer request tag (type 5): ask GRUB for a 1024x768, 32-bit
+    ; graphics mode. The kernel reads the result from the boot information
+    ; (fb.c). If GRUB cannot do it, it keeps text mode and the kernel falls
+    ; back to the VGA text console.
+    align 8
+    dw 5
+    dw 0
+    dd 20
+    dd 1024
+    dd 768
+    dd 32
 
     ; End tag
     align 8

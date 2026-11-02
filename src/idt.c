@@ -4,6 +4,11 @@
 #include "vga.h"
 #include "timer.h"
 #include "gdt.h"
+#include "keyboard.h"
+#include "mouse.h"
+#include "apic.h"
+#include "sched.h"
+#include "process.h"
 
 #define IDT_ENTRIES 256
 
@@ -31,7 +36,10 @@ static const char *const exception_names[32] = {
 };
 
 // Called from isr_common. Prints what happened and halts.
-void exception_handler(uintptr_t vector, uintptr_t error_code, uintptr_t ip) {
+void exception_handler(uintptr_t vector, uintptr_t error_code, uintptr_t ip, trap_frame_t *frame) {
+    /* A user program misbehaved: stop that process, keep the system running */
+    if (frame && TRAP_FROM_USER(frame)) proc_user_fault(frame, vector, error_code);
+
     vga_set_color(12, 0);  // Red text
     vga_print("\nEXCEPTION ");
     vga_print_int((int)vector);
@@ -59,6 +67,9 @@ void exception_handler(uintptr_t vector, uintptr_t error_code, uintptr_t ip) {
             vga_print("  Write to read-only memory\n");
         }
     }
+    if (vector == 8) {
+        vga_print("  Most likely a kernel stack overflow (the guard page was hit)\n");
+    }
     vga_set_color(7, 0);
     vga_print("System halted.\n");
     for (;;) {
@@ -72,40 +83,56 @@ static uint8_t pic_read_isr(uint16_t cmd_port) {
     return inb(cmd_port);
 }
 
-void irq_handler(uintptr_t vector) {
+/* Tell the interrupt controller we are done with this interrupt */
+static void send_eoi(int irq) {
+    if (apic_is_active()) {
+        lapic_eoi();
+        return;
+    }
+    if (irq >= 8) outb(PIC2_CMD, PIC_EOI);    /* the slave PIC needs one too for IRQs 8-15 */
+    outb(PIC1_CMD, PIC_EOI);
+}
+
+void irq_handler(uintptr_t vector, trap_frame_t *frame) {
     /* The PIC is remapped so hardware IRQ n arrives as vector 32 + n */
     int irq = (int)vector - 32;
 
-    /* Spurious IRQ 7 / 15: the PIC raised the line but nothing is in
-     * service. Do not acknowledge IRQ 7; for IRQ 15 only the master
-     * (which saw the cascade line) needs an EOI. */
-    if (irq == 7 && !(pic_read_isr(PIC1_CMD) & 0x80)) {
-        return;
-    }
-    if (irq == 15 && !(pic_read_isr(PIC2_CMD) & 0x80)) {
-        outb(PIC1_CMD, PIC_EOI);
-        return;
+    if (apic_is_active()) {
+        /* The local APIC's spurious vector needs no acknowledgement */
+        if (vector == APIC_SPURIOUS_VECTOR) return;
+    } else {
+        /* Spurious IRQ 7 / 15: the PIC raised the line but nothing is in
+         * service. Do not acknowledge IRQ 7; for IRQ 15 only the master
+         * (which saw the cascade line) needs an EOI. */
+        if (irq == 7 && !(pic_read_isr(PIC1_CMD) & 0x80)) {
+            return;
+        }
+        if (irq == 15 && !(pic_read_isr(PIC2_CMD) & 0x80)) {
+            outb(PIC1_CMD, PIC_EOI);
+            return;
+        }
     }
 
     switch (irq) {
         case IRQ_TIMER:
             timer_irq_handler();
-            break;
+            send_eoi(irq);               /* before the scheduler: it may switch tasks */
+            sched_tick(frame);
+            return;
         case IRQ_KEYBOARD:
+            keyboard_irq_handler();
+            break;
         case IRQ_MOUSE:
+            mouse_irq_handler();
+            break;
         case IRQ_ATA_DISK1:
         case IRQ_ATA_DISK2:
-            /* Devices are currently polled; nothing to do yet */
+            /* The disk is still polled; nothing to do yet */
             break;
         default:
             break;
     }
-
-    /* End of interrupt: the slave PIC needs one too for IRQs 8-15 */
-    if (irq >= 8) {
-        outb(PIC2_CMD, PIC_EOI);
-    }
-    outb(PIC1_CMD, PIC_EOI);
+    send_eoi(irq);
 }
 
 // Set an IDT entry
@@ -144,6 +171,10 @@ static void pic_init(void) {
 
 // Enable specific IRQ
 void pic_enable_irq(int irq) {
+    if (apic_is_active()) {                 // legacy interrupts go through the I/O APIC now
+        ioapic_enable_irq(irq);
+        return;
+    }
     uint16_t port = (irq < 8) ? PIC1_DATA : PIC2_DATA;
     uint8_t mask = inb(port);
     mask &= ~(1 << (irq % 8));  // Clear bit to enable
@@ -174,10 +205,13 @@ void idt_init(void) {
         idt_set_entry(i, isr_stub_table[i], 0x08, IDT_GATE_INTERRUPT);
     }
 
-    // Crash exceptions run on their own stacks (see gdt.c), so a trashed or
-    // overflowed kernel stack still produces a readable report
+    // Double fault, NMI and machine check run on their own stacks (see gdt.c).
+    // A kernel stack overflow hits the guard page, faults, and escalates to a
+    // double fault that is still reported. #PF and #GP stay on the normal
+    // kernel stack so a faulting user process can be stopped and the
+    // scheduler can run.
     idt[8].ist = IST_DOUBLE_FAULT;
-    static const int crash_vectors[] = { 2, 12, 13, 14, 18 };   // NMI, #SS, #GP, #PF, #MC
+    static const int crash_vectors[] = { 2, 18 };   // NMI, #MC
     for (unsigned i = 0; i < sizeof(crash_vectors) / sizeof(crash_vectors[0]); i++) {
         idt[crash_vectors[i]].ist = IST_CRASH;
     }

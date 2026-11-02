@@ -33,5 +33,7 @@ void mouse_init(void);
 void mouse_update(void);
 mouse_state_t* mouse_get(void);
 const char* mouse_get_driver_name(void);
+void mouse_irq_handler(void);     // called from the IRQ12 interrupt
+int  mouse_irq_active(void);      // 1 once the mouse interrupt is on
 
 #endif

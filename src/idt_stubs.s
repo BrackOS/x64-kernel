@@ -77,23 +77,25 @@ extern irq_handler
 
 section .text
 
-; void exception_handler(vector, error_code, rip)
+; void exception_handler(vector, error_code, rip, frame)
 isr_common:
     SAVE_REGS
     cld                         ; C code requires DF = 0
     mov rdi, [rsp + 120]        ; vector
     mov rsi, [rsp + 128]        ; error code
     mov rdx, [rsp + 136]        ; RIP of the faulting instruction
+    mov rcx, rsp                ; pointer to the saved registers (trap_frame_t)
     call exception_handler
     RESTORE_REGS
     add rsp, 16                 ; drop vector + error code
     iretq
 
-; void irq_handler(vector)
+; void irq_handler(vector, frame)
 irq_common:
     SAVE_REGS
     cld
     mov rdi, [rsp + 120]        ; vector (32-47)
+    mov rsi, rsp                ; pointer to the saved registers (trap_frame_t)
     call irq_handler
     RESTORE_REGS
     add rsp, 16

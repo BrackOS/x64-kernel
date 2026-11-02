@@ -11,6 +11,7 @@ extern const uint8_t font_data[FONT_CHAR_COUNT][FONT_HEIGHT];
 
 void font_init(void);
 void font_draw_char(int x, int y, char c, uint32_t fg, uint32_t bg);
+void font_draw_char_scaled(int x, int y, char c, uint32_t fg, uint32_t bg, int sx, int sy);
 void font_draw_string(int x, int y, const char *str, uint32_t fg, uint32_t bg);
 
 #endif

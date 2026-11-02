@@ -1,4 +1,5 @@
 #include "multiboot.h"
+#include "string.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -27,4 +28,20 @@ const void *multiboot_find_tag(uint32_t wanted) {
         p += (t->size + 7) & ~7u;   /* tags are 8-byte aligned */
     }
     return NULL;
+}
+
+/* Is `word` one of the space-separated words on the kernel command line
+ * (the text after the kernel name in the GRUB menu entry)? */
+int multiboot_cmdline_has(const char *word) {
+    const char *tag = (const char *)multiboot_find_tag(1);   /* type 1: boot command line */
+    if (!tag) return 0;
+    const char *cmd = tag + 8;                                /* after the tag's type and size */
+    size_t wl = strlen(word);
+    while (*cmd) {
+        while (*cmd == ' ') cmd++;
+        const char *start = cmd;
+        while (*cmd && *cmd != ' ') cmd++;
+        if ((size_t)(cmd - start) == wl && strncmp(start, word, wl) == 0) return 1;
+    }
+    return 0;
 }
